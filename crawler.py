@@ -1,34 +1,24 @@
 # -*- coding: utf-8 -*-
 import os
-import re
 import time
 import random
-import cloudscraper
+import requests
 from pathlib import Path
-from bs4 import BeautifulSoup
 
 # ===== 初始化配置 =====
 BASE_DIR = Path(__file__).resolve().parent
 DISHES_DIR = BASE_DIR / "cook" / "dishes"
-BAIKE_URL = "https://baike.baidu.com/item/{}"
-DELAY = 1
-TIMEOUT = 15
+API_URL = "https://appbuilder.baidu.com/v2/baike/lemma/get_content"
+API_HEADERS = {
+    "Content-Type": "application/json",
+    "Authorization": "Bearer bce-v3/ALTAK-wdlePO0kBV3InmOLDQo26/44c2c34b9458861d9048577867e3424e08aeb90f",
+}
+DELAY_MIN = 1.5    # 正常请求间隔最小值（秒）
+DELAY_MAX = 3.0    # 正常请求间隔最大值（秒）
+TIMEOUT = 10
 MAX_RETRIES = 3
-
-_scraper = None
-
-
-def get_scraper():
-    global _scraper
-    if _scraper is None:
-        _scraper = cloudscraper.create_scraper(
-            browser={
-                "browser": "chrome",
-                "platform": "darwin",
-                "mobile": False,
-            }
-        )
-    return _scraper
+BACKOFF_BASE = 5    # 429 退避基础等待（秒）
+CONSECUTIVE_429_LIMIT = 8  # 连续 429 超过此数则长等待
 
 
 def extract_dish_names(dishes_dir):
@@ -43,120 +33,129 @@ def extract_dish_names(dishes_dir):
     return dish_files
 
 
-def clean_summary(summary_element):
-    """清理摘要：移除引用标记（sup 标签）和引用链接"""
-    for sup in summary_element.find_all("sup"):
-        sup.decompose()
-    for a in summary_element.find_all("a"):
-        if a.get("href") and ("reference" in a.get("href", "") or a.get("class") and "sup" in str(a.get("class"))):
-            a.decompose()
-
-    text = summary_element.get_text(strip=True)
-    text = re.sub(r"\[\d+(?:-\d+)?\]", "", text)
-    text = re.sub(r"\s+", "", text)
-    return text
+def already_has_intro(filepath, dish_name):
+    """检查文件是否已包含百科介绍"""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        return first_line == f"# {dish_name}的介绍"
+    except Exception:
+        return False
 
 
 def search_baike(dish_name):
-    """搜索百度百科词条，返回词条摘要文本；失败返回 None"""
-    url = BAIKE_URL.format(dish_name)
-    scraper = get_scraper()
+    """通过百度百科 API 搜索菜品词条，返回 summary 文本；失败返回 None"""
+    params = {"search_type": "lemmaTitle", "search_key": dish_name}
+    last_429 = False
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = scraper.get(url, timeout=TIMEOUT)
-            resp.encoding = "utf-8"
+            resp = requests.get(API_URL, headers=API_HEADERS, params=params, timeout=TIMEOUT)
 
-            if resp.status_code == 403:
-                print(f"  [{dish_name}] HTTP 403（反爬拦截），尝试 {attempt}/{MAX_RETRIES}")
-                if attempt < MAX_RETRIES:
-                    time.sleep(DELAY * (attempt + 1))
+            if resp.status_code == 429:
+                wait = BACKOFF_BASE * (2 ** (attempt - 1))
+                print(f"    HTTP 429（限流），等待 {wait}s 后重试...")
+                time.sleep(wait)
+                last_429 = True
                 continue
 
             if resp.status_code != 200:
-                print(f"  [{dish_name}] HTTP {resp.status_code}，尝试 {attempt}/{MAX_RETRIES}")
+                print(f"    HTTP {resp.status_code}")
                 if attempt < MAX_RETRIES:
-                    time.sleep(DELAY * attempt)
+                    time.sleep(DELAY_MIN * attempt)
                 continue
 
-            soup = BeautifulSoup(resp.text, "lxml")
+            data = resp.json()
+            result = data.get("result")
 
-            summary = soup.find("div", class_="J-summary")
-            if summary is None:
-                summary = soup.find("div", class_="lemma-summary")
-            if summary is None:
-                summary = soup.find("div", attrs={"data-tid": "lemma-summary"})
+            if not result:
+                return None  # 无词条，静默跳过
 
+            summary = result.get("summary", "").strip()
             if summary:
-                text = clean_summary(summary)
-                if text:
-                    return text
-                else:
-                    print(f"  [{dish_name}] 摘要为空")
-                    return None
+                return summary
             else:
-                print(f"  [{dish_name}] 未找到词条摘要")
                 return None
 
-        except Exception as e:
-            print(f"  [{dish_name}] 请求异常: {e}，尝试 {attempt}/{MAX_RETRIES}")
+        except requests.exceptions.Timeout:
+            print(f"    请求超时，尝试 {attempt}/{MAX_RETRIES}")
             if attempt < MAX_RETRIES:
-                time.sleep(DELAY * attempt)
+                time.sleep(DELAY_MIN * attempt)
+        except Exception as e:
+            print(f"    异常: {e}，尝试 {attempt}/{MAX_RETRIES}")
+            if attempt < MAX_RETRIES:
+                time.sleep(DELAY_MIN * attempt)
 
     return None
 
 
 def update_md_file(filepath, dish_name, summary):
-    """在 md 文件头部插入百科摘要，其余内容保持不变"""
+    """在 md 文件头部插入百科摘要"""
     intro_header = f"# {dish_name}的介绍"
     intro_block = f"{intro_header}\n{summary}\n\n"
 
     with open(filepath, "r", encoding="utf-8") as f:
         content = f.read()
 
-    if intro_header in content:
-        print(f"  [{dish_name}] 文件已包含百科介绍，跳过")
-        return
-
     new_content = intro_block + content
-
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(new_content)
 
-    print(f"  [{dish_name}] 已更新百科介绍")
-
 
 def main():
-    print("=" * 50)
-    print("百度百科菜品爬虫")
+    print("=" * 55)
+    print("百度百科菜品爬虫（API 版 v2 — 限流优化）")
     print(f"菜品目录: {DISHES_DIR}")
-    print("=" * 50)
+    print(f"请求间隔: {DELAY_MIN}-{DELAY_MAX}s | 429退避: {BACKOFF_BASE}s 起")
+    print("=" * 55)
 
     dish_files = extract_dish_names(DISHES_DIR)
-    print(f"共发现 {len(dish_files)} 个菜品\n")
-
+    total = len(dish_files)
     success_count = 0
     skip_count = 0
+    consecutive_429 = 0
+    long_wait_triggered = 0
 
-    for i, (dish_name, filepath) in enumerate(dish_files, 1):
-        print(f"[{i}/{len(dish_files)}] 处理: {dish_name}")
+    pending = []
+    for dish_name, filepath in dish_files:
+        if already_has_intro(filepath, dish_name):
+            success_count += 1  # 计入已成功
+        else:
+            pending.append((dish_name, filepath))
+
+    print(f"总菜品: {total} | 已完成: {success_count} | 待处理: {len(pending)}")
+    print()
+
+    for i, (dish_name, filepath) in enumerate(pending, 1):
+        # 连续 429 太多时，长等待恢复
+        if consecutive_429 >= CONSECUTIVE_429_LIMIT:
+            long_wait = 60
+            long_wait_triggered += 1
+            print(f"\n⚠️  连续 {consecutive_429} 次 429，等待 {long_wait}s 恢复限额...")
+            time.sleep(long_wait)
+            consecutive_429 = 0
+
+        print(f"[{i}/{len(pending)}] {dish_name}:", end=" ", flush=True)
 
         summary = search_baike(dish_name)
 
         if summary:
             update_md_file(filepath, dish_name, summary)
             success_count += 1
+            print(f"✅")
+            consecutive_429 = 0
         else:
-            print(f"  [{dish_name}] 无法获取百科信息，跳过")
             skip_count += 1
+            print(f"跳过")
 
-        # 随机延迟，模拟人为访问
-        delay = DELAY + random.uniform(0.5, 2.0)
+        delay = random.uniform(DELAY_MIN, DELAY_MAX)
         time.sleep(delay)
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 55)
     print(f"处理完成: 成功 {success_count} 个，跳过 {skip_count} 个")
-    print("=" * 50)
+    if long_wait_triggered:
+        print(f"长等待恢复次数: {long_wait_triggered}")
+    print("=" * 55)
 
 
 if __name__ == "__main__":
